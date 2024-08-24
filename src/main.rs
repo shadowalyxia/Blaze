@@ -7,30 +7,29 @@ use serde_json::json;
 use chrono::Local;
 use tokio;
 
-// Discord Notification
-const DISCORD_WEBHOOK_URL: &str = "URL"; // Replace the 'URL' with your Discord Webhook URL
+// Configuration
+const DISCORD_WEBHOOK_URL: &str = "URL"; // Replace with your Discord Webhook URL
+const ALERT_ROLE_ID: &str = "ID"; // Replace with your Role ID for critical alerts
+const NORMAL_ROLE_ID: &str = "ID"; // Replace with your Role ID for alert state changes
 
-// Alerts and normal pings
-const ALERT_ROLE_ID: &str = "ID"; // Replace the 'ID' with your Role ID for critical alerts
-const NORMAL_ROLE_ID: &str = "ID"; // Replace the 'ID' with your Role ID for alert state changes
+const CPU_THRESHOLD: f32 = 90.0;
+const RAM_THRESHOLD: f32 = 90.0;
+const PROCESS_CPU_THRESHOLD: f32 = 80.0;
+const PROCESS_RAM_THRESHOLD: f32 = 80.0;
+const DDOS_THRESHOLD_MB_PER_SEC: f64 = 100.0;
+const DDOS_CHECK_PERIODS: usize = 5;
 
-// Thresholds for resource usage
-const CPU_THRESHOLD: f32 = 90.0; // Replace 90.0 with your preferred percentage number for CPU usage threshold
-const RAM_THRESHOLD: f32 = 90.0; // Replace 90.0 with your preferred percentage number for RAM usage threshold
-const PROCESS_CPU_THRESHOLD: f32 = 80.0; // Replace 80.0 with your preferred percentage number for individual process CPU usage threshold
-const PROCESS_RAM_THRESHOLD: f32 = 80.0; // Replace 80.0 with your preferred percentage number for individual process RAM usage threshold
+// Configuration for editing messages
+const EDIT_MESSAGE: bool = true; // Set to true to edit the existing message, false to send a new one
 
-// DDoS detection parameters
-// If you don't want alerts for DDoS Attack then set change the value 100.0 to 1000000000.0
-const DDOS_THRESHOLD_MB_PER_SEC: f64 = 100.0; // Replace 100.0 with your preferred MB/s for DDoS detection threshold
-const DDOS_CHECK_PERIODS: usize = 5; // Replace 5 with the number of times the script as to check before triggering DDoS Attack Alert
-
+static mut DISCORD_MESSAGE_ID: Option<String> = None;
 
 struct AlertState {
     cpu_alert: bool,
     ram_alert: bool,
     ddos_alert: bool,
     process_alert: bool,
+    failed_logins: u32, // Track the number of failed logins
 }
 
 #[tokio::main]
@@ -41,10 +40,16 @@ async fn main() {
         ram_alert: false,
         ddos_alert: false,
         process_alert: false,
+        failed_logins: 0,
     }));
 
     let system_clone = Arc::clone(&system);
     let alert_state_clone = Arc::clone(&alert_state);
+
+    // Initial message sending
+    if EDIT_MESSAGE {
+        send_summary(&system.lock().await).await;
+    }
 
     tokio::task::spawn(async move {
         let mut last_network_rx = 0;
@@ -56,7 +61,7 @@ async fn main() {
                 let sys = system_clone.lock().await;
                 check_resources(&sys, &alert_state_clone, &mut last_network_rx, &mut last_check, &mut network_rates).await;
             }
-            tokio::time::sleep(Duration::from_secs(3)).await; // Customize this duration to adjust the monitoring frequency - By Deafult it is set to 3 seconds
+            tokio::time::sleep(Duration::from_secs(3)).await; // Adjust as needed
             system_clone.lock().await.refresh_all();
         }
     });
@@ -64,9 +69,13 @@ async fn main() {
     loop {
         {
             let sys = system.lock().await;
-            send_summary(&sys).await;
+            if EDIT_MESSAGE {
+                edit_summary(&sys).await;
+            } else {
+                send_summary(&sys).await;
+            }
         }
-        tokio::time::sleep(Duration::from_secs(1800)).await; // Customize this duration to adjust the summary reporting frequency - By Deafult it is set to 30mins 
+        tokio::time::sleep(Duration::from_secs(1800)).await; // 30 minutes
     }
 }
 
@@ -133,6 +142,28 @@ async fn check_resources(system: &sysinfo::System, alert_state: &Arc<Mutex<Alert
 
     *last_network_rx = current_network_rx;
     *last_check = Instant::now();
+
+    // Check failed login attempts
+    let failed_logins = check_failed_logins().await;
+    if failed_logins > state.failed_logins {
+        let new_attempts = failed_logins - state.failed_logins;
+        let message = format!("{} new failed login attempts detected!", new_attempts);
+        send_alert("Failed Login Attempts", &message).await;
+        state.failed_logins = failed_logins;
+    }
+}
+
+async fn check_failed_logins() -> u32 {
+    // Use command to get failed login attempts
+    let output = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg("sudo journalctl | grep -E 'Failed password|Invalid user|Failed publickey' | wc -l")
+        .output()
+        .await
+        .expect("Failed to execute command");
+    
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    output_str.trim().parse().unwrap_or(0)
 }
 
 async fn send_summary(system: &sysinfo::System) {
@@ -148,10 +179,13 @@ async fn send_summary(system: &sysinfo::System) {
     let network_tx: u64 = system.networks().iter().map(|(_, network)| network.total_transmitted()).sum();
     let network_rx: u64 = system.networks().iter().map(|(_, network)| network.total_received()).sum();
 
+    let top_cpu_processes = get_top_processes(system, true);
+    let top_ram_processes = get_top_processes(system, false);
+
     let summary = json!({
         "embeds": [{
             "title": "Resource Usage Summary",
-            "color": 14869218, // Customize the color here -- 14869218 is Decimel code for grey color (Default color is grey)
+            "color": 14869218,
             "fields": [
                 {
                     "name": "CPU Usage",
@@ -186,8 +220,13 @@ async fn send_summary(system: &sysinfo::System) {
                     "inline": false
                 },
                 {
-                    "name": "Top Processes",
-                    "value": get_top_processes(system),
+                    "name": "Top CPU Processes",
+                    "value": top_cpu_processes,
+                    "inline": false
+                },
+                {
+                    "name": "Top RAM Processes",
+                    "value": top_ram_processes,
                     "inline": false
                 },
                 {
@@ -200,13 +239,26 @@ async fn send_summary(system: &sysinfo::System) {
         }]
     });
 
-    send_discord_message(&summary).await;
+    if let Some(message_id) = unsafe { DISCORD_MESSAGE_ID.as_ref() } {
+        edit_discord_message(&summary, message_id).await;
+    } else {
+        let res = send_discord_message(&summary).await;
+        if let Ok(response) = res {
+            unsafe {
+                DISCORD_MESSAGE_ID = response.message_id;
+            }
+        }
+    }
 }
 
-fn get_top_processes(system: &sysinfo::System) -> String {
+fn get_top_processes(system: &sysinfo::System, by_cpu: bool) -> String {
     let mut processes: Vec<_> = system.processes().iter().collect();
-    processes.sort_by(|a, b| b.1.cpu_usage().partial_cmp(&a.1.cpu_usage()).unwrap());
-    
+    processes.sort_by(|a, b| {
+        let a_metric = if by_cpu { a.1.cpu_usage() } else { a.1.memory() as f32 / system.total_memory() as f32 * 100.0 };
+        let b_metric = if by_cpu { b.1.cpu_usage() } else { b.1.memory() as f32 / system.total_memory() as f32 * 100.0 };
+        b_metric.partial_cmp(&a_metric).unwrap()
+    });
+
     processes.iter().take(3)
         .map(|(_, process)| {
             format!("• {}: {:.2}% CPU | {:.2}GB RAM", 
@@ -226,11 +278,11 @@ async fn send_alert(title: &str, message: &str) {
         "embeds": [{
             "title": title,
             "description": message,
-            "color": 15158332 // Customize the color here -- 15158332 is Decimel code for red color (Default color is red)
+            "color": 15158332 // Red color
         }]
     });
 
-    send_discord_message(&payload).await;
+    send_discord_message(&payload).await.unwrap();
 }
 
 async fn send_normal_ping(message: &str) {
@@ -239,21 +291,38 @@ async fn send_normal_ping(message: &str) {
         "content": content,
         "embeds": [{
             "description": message,
-            "color": 3066993 // Customize the color here -- 3066993 is Decimel code for green color (Default color is green)
+            "color": 3066993 // Green color
         }]
     });
 
-    send_discord_message(&payload).await;
+    send_discord_message(&payload).await.unwrap();
 }
 
-async fn send_discord_message(payload: &serde_json::Value) {
+async fn send_discord_message(payload: &serde_json::Value) -> Result<DiscordResponse, reqwest::Error> {
     let client = reqwest::Client::new();
     let res = client.post(DISCORD_WEBHOOK_URL)
         .json(payload)
         .send()
-        .await;
+        .await?;
 
-    if let Err(e) = res {
-        eprintln!("Failed to send Discord message: {}", e);
+    #[derive(Deserialize)]
+    struct DiscordResponse {
+        id: String,
+        channel_id: String,
+        // Other fields can be added as needed
+    }
+
+    Ok(res.json().await?)
+}
+
+async fn edit_discord_message(payload: &serde_json::Value, message_id: &str) {
+    let client = reqwest::Client::new();
+    let url = format!("{}/messages/{}", DISCORD_WEBHOOK_URL, message_id);
+    if let Err(e) = client.patch(&url)
+        .json(payload)
+        .send()
+        .await
+    {
+        eprintln!("Failed to edit Discord message: {}", e);
     }
 }
