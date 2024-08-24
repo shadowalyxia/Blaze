@@ -9,7 +9,7 @@ install_packages() {
 # Clone the Git repository
 clone_repo() {
   echo "Cloning the ShadowArcanist's Blaze git repository..."
-  sudo git clone https://github.com/ShadowArcanist/Blaze.git /opt/Blaze
+  sudo git clone https://github.com/shadowalyxia/Blaze.git /opt/Blaze
   cd /opt/Blaze || { echo "Failed to clone ShadowArcanist's Blaze git repository"; exit 1; }
 }
 
